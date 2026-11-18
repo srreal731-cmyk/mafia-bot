@@ -6,9 +6,12 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message
+from aiogram.client.session.aiohttp import AiohttpSession
 
 TOKEN = "9025565078:AAH2em1-DEk_BQncxQWfGuaqfE-YL8YRPoQ"
 
+# Tarmoq kechikishlariga bardosh berish uchun timeout vaqtini kattalashtiramiz
+session = AiohttpSession(timeout=60)
 dp = Dispatcher()
 
 @dp.message(CommandStart())
@@ -16,7 +19,7 @@ async def command_start_handler(message: Message) -> None:
     await message.answer(f"Salom, {html.bold(message.from_user.full_name)}! Mafia botiga xush kelibsiz! 🐺")
 
 async def main() -> None:
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(token=TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
