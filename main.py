@@ -19,7 +19,7 @@ dp = Dispatcher()
 games: dict[int, dict[int, str]] = {}
 # Boshlangan o'yinlar: {chat_id: {user_id: rol}}
 roles: dict[int, dict[int, str]] = {}
-MIN_PLAYERS = 4  # sinash uchun vaqtincha 2 qilib turing
+MIN_PLAYERS = 2  # sinash uchun vaqtincha 2 qilib turing
 
 
 def players_text(chat_id: int) -> str:
