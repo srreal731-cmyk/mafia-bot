@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import sys
+from collections import Counter
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, html
 from aiogram.client.default import DefaultBotProperties
@@ -15,34 +16,36 @@ TOKEN = os.environ["BOT_TOKEN"]
 PORT = int(os.environ.get("PORT", 10000))
 dp = Dispatcher()
 
-MIN_PLAYERS = 2  # haqiqiy o'yin uchun 4 qiling
-
-# Ochilgan o'yinlar: {chat_id: {user_id: ism}}
-games: dict[int, dict[int, str]] = {}
-# Boshlangan o'yinlar: {chat_id: {user_id: rol}}
-roles: dict[int, dict[int, str]] = {}
-# Tirik o'yinchilar: {chat_id: set(user_id)}
-alive: dict[int, set[int]] = {}
+MIN_PLAYERS = 4  # sinash uchun vaqtincha kamaytirishingiz mumkin
 
 MAFIA = "🕵️ Mafia"
+DOCTOR = "👨‍⚕️ Shifokor"
+COMMISSAR = "🔎 Komissar"
+CIVIL = "👤 Tinch aholi"
+
+games: dict[int, dict[int, str]] = {}      # {chat: {uid: ism}}
+roles: dict[int, dict[int, str]] = {}      # {chat: {uid: rol}}
+alive: dict[int, set[int]] = {}            # {chat: {uid}}
+phase: dict[int, str] = {}                 # {chat: "night" | "day"}
+night: dict[int, dict] = {}                # {chat: {"kill","heal","check"}}
+votes: dict[int, dict[int, int]] = {}      # {chat: {voter: target}}
 
 
 def players_text(chat_id: int) -> str:
     players = games[chat_id]
     if not players:
         return "Hozircha hech kim yo'q."
-    lines = [f"{i}. {html.quote(name)}" for i, name in enumerate(players.values(), 1)]
+    lines = [f"{i}. {html.quote(n)}" for i, n in enumerate(players.values(), 1)]
     return f"Qatnashchilar ({len(players)}):\n" + "\n".join(lines)
 
 
 def make_roles(n: int) -> list[str]:
-    mafia = max(1, n // 4)
-    result = [MAFIA] * mafia
+    result = [MAFIA] * max(1, n // 4)
     if n >= 3:
-        result.append("👨‍⚕️ Shifokor")
+        result.append(DOCTOR)
     if n >= 4:
-        result.append("🔎 Komissar")
-    result += ["👤 Tinch aholi"] * (n - len(result))
+        result.append(COMMISSAR)
+    result += [CIVIL] * (n - len(result))
     random.shuffle(result)
     return result
 
@@ -58,15 +61,16 @@ def check_winner(chat_id: int) -> str | None:
 
 
 def reveal_roles(chat_id: int) -> str:
-    return "\n".join(
-        f"{html.quote(games[chat_id][u])}: {r}" for u, r in roles[chat_id].items()
-    )
+    return "\n".join(f"{html.quote(games[chat_id][u])}: {r}" for u, r in roles[chat_id].items())
 
 
 def finish(chat_id: int) -> None:
-    games.pop(chat_id, None)
-    roles.pop(chat_id, None)
-    alive.pop(chat_id, None)
+    for d in (games, roles, alive, phase, night, votes):
+        d.pop(chat_id, None)
+
+
+def alive_with_role(chat_id: int, role: str) -> list[int]:
+    return [u for u in alive[chat_id] if roles[chat_id][u] == role]
 
 
 async def is_admin(message: Message) -> bool:
@@ -76,6 +80,157 @@ async def is_admin(message: Message) -> bool:
     return member.status in ("administrator", "creator")
 
 
+async def end_if_winner(bot: Bot, chat_id: int, text: str) -> bool:
+    winner = check_winner(chat_id)
+    if winner:
+        await bot.send_message(chat_id, f"{text}\n\n{winner}\n\nRollar:\n{reveal_roles(chat_id)}")
+        finish(chat_id)
+        return True
+    return False
+
+
+# ---------- KECHA ----------
+async def start_night(bot: Bot, chat_id: int) -> None:
+    phase[chat_id] = "night"
+    night[chat_id] = {"kill": None, "heal": None, "check": None}
+    await bot.send_message(chat_id, "🌙 <b>Kecha tushdi.</b> Mafia, shifokor va komissar tanlov qilmoqda...")
+
+    def kb(kind: str, exclude: set[int]) -> InlineKeyboardMarkup:
+        rows = [
+            [InlineKeyboardButton(text=games[chat_id][t], callback_data=f"act:{kind}:{chat_id}:{t}")]
+            for t in alive[chat_id] if t not in exclude
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    mafias = set(alive_with_role(chat_id, MAFIA))
+    prompts = [
+        ("kill", MAFIA, "🌙 <b>Kimni o'ldirasiz?</b>", mafias),
+        ("heal", DOCTOR, "💉 <b>Kimni davolaysiz?</b>", set()),
+        ("check", COMMISSAR, "🔎 <b>Kimni tekshirasiz?</b>", set()),
+    ]
+    for kind, role, text, exclude in prompts:
+        for uid in alive_with_role(chat_id, role):
+            ex = exclude if kind == "kill" else (exclude | {uid})
+            try:
+                await bot.send_message(uid, text, reply_markup=kb(kind, ex))
+            except Exception:
+                await bot.send_message(chat_id, f"⚠️ {html.quote(games[chat_id][uid])} ga xabar yuborib bo'lmadi. Avval botga /start yuborsin.")
+
+
+async def try_resolve_night(bot: Bot, chat_id: int) -> None:
+    n = night[chat_id]
+    if n["kill"] is None:
+        return
+    if alive_with_role(chat_id, DOCTOR) and n["heal"] is None:
+        return
+    if alive_with_role(chat_id, COMMISSAR) and n["check"] is None:
+        return
+
+    victim = n["kill"]
+    if victim == n["heal"]:
+        text = "☀️ <b>Tong otdi!</b>\nTunda hech kim o'lmadi: shifokor qurbonni qutqardi! 💉"
+    else:
+        alive[chat_id].discard(victim)
+        text = f"☀️ <b>Tong otdi!</b>\nTunda {html.quote(games[chat_id][victim])} o'ldirildi. 💀"
+    if await end_if_winner(bot, chat_id, text):
+        return
+    await bot.send_message(chat_id, text)
+    await start_day(bot, chat_id)
+
+
+@dp.callback_query(F.data.startswith("act:"))
+async def act_handler(call: CallbackQuery, bot: Bot) -> None:
+    _, kind, chat_s, target_s = call.data.split(":")
+    chat_id, target = int(chat_s), int(target_s)
+    uid = call.from_user.id
+    need = {"kill": MAFIA, "heal": DOCTOR, "check": COMMISSAR}[kind]
+
+    if chat_id not in roles or phase.get(chat_id) != "night":
+        await call.answer("Hozir kecha emas yoki o'yin tugagan.", show_alert=True)
+        return
+    if uid not in alive[chat_id] or roles[chat_id][uid] != need:
+        await call.answer("Bu sizga tegishli emas.", show_alert=True)
+        return
+    if target not in alive[chat_id]:
+        await call.answer("Bu o'yinchi tirik emas.", show_alert=True)
+        return
+    if night[chat_id][kind] is not None:
+        await call.answer("Tanlov allaqachon qilingan.", show_alert=True)
+        return
+
+    night[chat_id][kind] = target
+    name = html.quote(games[chat_id][target])
+    if kind == "check":
+        result = "🕵️ MAFIA" if roles[chat_id][target] == MAFIA else "✅ Mafia emas"
+        await call.message.edit_text(f"🔎 {name}: <b>{result}</b>")
+    else:
+        await call.message.edit_text(f"✅ Siz tanladingiz: {name}")
+    await call.answer()
+    await try_resolve_night(bot, chat_id)
+
+
+# ---------- KUNDUZ ----------
+async def start_day(bot: Bot, chat_id: int) -> None:
+    phase[chat_id] = "day"
+    votes[chat_id] = {}
+    rows = [
+        [InlineKeyboardButton(text=games[chat_id][t], callback_data=f"vote:{chat_id}:{t}")]
+        for t in alive[chat_id]
+    ]
+    names = "\n".join(f"• {html.quote(games[chat_id][u])}" for u in alive[chat_id])
+    await bot.send_message(
+        chat_id,
+        f"🗳 <b>Kunduz. Ovoz berish!</b>\nKimni osamiz? Tirik o'yinchilar:\n{names}\n\n"
+        "Hamma ovoz bergach natija chiqadi. Admin /endvote bilan tugatishi mumkin.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def resolve_day(bot: Bot, chat_id: int) -> None:
+    counts = Counter(votes[chat_id].values())
+    if not counts:
+        text = "🤷 Hech kim ovoz bermadi. Bugun hech kim osilmadi."
+    else:
+        top = counts.most_common()
+        if len(top) > 1 and top[0][1] == top[1][1]:
+            text = "⚖️ Ovozlar teng bo'ldi. Bugun hech kim osilmadi."
+        else:
+            victim = top[0][0]
+            alive[chat_id].discard(victim)
+            text = (
+                f"⚰️ Ko'pchilik ovozi bilan {html.quote(games[chat_id][victim])} osildi.\n"
+                f"Uning roli: {roles[chat_id][victim]}"
+            )
+    if await end_if_winner(bot, chat_id, text):
+        return
+    await bot.send_message(chat_id, text)
+    await start_night(bot, chat_id)
+
+
+@dp.callback_query(F.data.startswith("vote:"))
+async def vote_handler(call: CallbackQuery, bot: Bot) -> None:
+    _, chat_s, target_s = call.data.split(":")
+    chat_id, target = int(chat_s), int(target_s)
+    uid = call.from_user.id
+
+    if chat_id not in roles or phase.get(chat_id) != "day":
+        await call.answer("Hozir ovoz berish vaqti emas.", show_alert=True)
+        return
+    if uid not in alive[chat_id]:
+        await call.answer("Faqat tirik o'yinchilar ovoz beradi.", show_alert=True)
+        return
+    if target not in alive[chat_id]:
+        await call.answer("Bu o'yinchi tirik emas.", show_alert=True)
+        return
+
+    votes[chat_id][uid] = target
+    await call.answer(f"Ovoz: {games[chat_id][target]}")
+    if len(votes[chat_id]) >= len(alive[chat_id]):
+        phase[chat_id] = "resolving"
+        await resolve_day(bot, chat_id)
+
+
+# ---------- BUYRUQLAR ----------
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
     await message.answer(
@@ -93,6 +248,7 @@ async def help_handler(message: Message) -> None:
         "/leave - o'yindan chiqish\n"
         "/players - qatnashchilar ro'yxati\n"
         "/startgame - o'yinni boshlash\n"
+        "/endvote - ovoz berishni tugatish (admin)\n"
         "/endgame - o'yinni tugatish (admin)\n"
         "/help - shu yordam xabari\n\n"
         "O'yinni guruh chatida o'ynang.\n"
@@ -187,52 +343,23 @@ async def startgame_handler(message: Message, bot: Bot) -> None:
     alive[chat_id] = set(assigned.keys())
     mafia_count = sum(1 for r in assigned.values() if r == MAFIA)
     await message.answer(
-        f"🌙 O'yin boshlandi! Qatnashchilar: {len(players)}\n"
-        f"Mafia soni: {mafia_count}\nRollar shaxsiy xabarda yuborildi.\n\n"
-        "Kecha tushdi... Mafia tanlov qilmoqda."
+        f"🎲 O'yin boshlandi! Qatnashchilar: {len(players)}\n"
+        f"Mafia soni: {mafia_count}\nRollar shaxsiy xabarda yuborildi."
     )
-
-    # Mafiyaga "Kimni o'ldirasiz?" tugmalari
-    for uid, role in assigned.items():
-        if role != MAFIA:
-            continue
-        buttons = [
-            [InlineKeyboardButton(text=name, callback_data=f"kill:{chat_id}:{target}")]
-            for target, name in players.items()
-            if target != uid
-        ]
-        await bot.send_message(
-            uid,
-            "🌙 <b>Kimni o'ldirasiz?</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        )
+    await start_night(bot, chat_id)
 
 
-@dp.callback_query(F.data.startswith("kill:"))
-async def kill_handler(call: CallbackQuery, bot: Bot) -> None:
-    _, chat_id_s, target_s = call.data.split(":")
-    chat_id, target = int(chat_id_s), int(target_s)
-
-    if chat_id not in roles or roles[chat_id].get(call.from_user.id) != MAFIA:
-        await call.answer("Bu o'yin tugagan yoki siz mafia emassiz.", show_alert=True)
+@dp.message(Command("endvote"))
+async def endvote_handler(message: Message, bot: Bot) -> None:
+    chat_id = message.chat.id
+    if phase.get(chat_id) != "day":
+        await message.answer("Hozir ovoz berish vaqti emas.")
         return
-    if target not in alive[chat_id]:
-        await call.answer("Bu o'yinchi allaqachon o'lgan.", show_alert=True)
+    if not await is_admin(message):
+        await message.answer("Faqat guruh adminlari buni qila oladi.")
         return
-
-    victim_name = games[chat_id][target]
-    alive[chat_id].discard(target)
-    await call.message.edit_text(f"✅ Siz tanladingiz: {html.quote(victim_name)}")
-    await call.answer()
-
-    text = f"☀️ <b>Tong otdi!</b>\nTunda {html.quote(victim_name)} o'ldirildi. 💀"
-    winner = check_winner(chat_id)
-    if winner:
-        text += f"\n\n{winner}\n\nRollar:\n{reveal_roles(chat_id)}"
-        finish(chat_id)
-    else:
-        text += "\n\nO'yin davom etadi."
-    await bot.send_message(chat_id, text)
+    phase[chat_id] = "resolving"
+    await resolve_day(bot, chat_id)
 
 
 @dp.message(Command("endgame"))
